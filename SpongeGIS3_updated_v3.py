@@ -4,9 +4,6 @@
 """
 SpongeGIS (raster-based indicators by SPU)
 
-This version updates SpongeGIS3.py with fixes that directly address the common
-vector↔raster mismatches observed in the Kamienna test run:
-
 Key fixes / changes
 - Stream-derived metrics (DrainageD, RiverSlope, MeanderRatio) are now set to NaN
   for SPUs with no stream cells (previously they were 0 due to bincount fill). This
@@ -27,6 +24,20 @@ Notes
 - Landcover ratios treat presence as (value > 0). NoData is treated as "absence"
   for ratio computations (i.e., it contributes 0 to the numerator and counts in the
   denominator via the SPU zone raster).
+
+To run
+--spongegis_path
+E:\pythonProject\PythonProject\SpongeGIS\SpongeGIS3_updated_v3.py
+--csv
+Y:\download\Mamad\!SpongeGIStest\Kamienna\output\indicators_by_spu.csv
+--missing-report
+Y:\download\Mamad\!SpongeGIStest\Kamienna\output\report_missing_inputs.txt
+--use_hardcoded_r
+--hc_abs_tol
+1e-6
+--hc_rel_tol
+1e-6
+
 """
 
 from __future__ import annotations
@@ -60,6 +71,7 @@ ALL_FACTORS = [
     # Sediment
     "GraniteRatio", "RainFallErodibility", "SoilErodibility",
 ]
+
 
 
 # ---------------------------

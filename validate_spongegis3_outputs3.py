@@ -14,12 +14,19 @@ Hard-coded expectations:
 - Only the overlap with SpongeGIS3 ALL_FACTORS is compared.
 - GraniteRatio has no R expectation and is not compared in hard-coded mode.
 
-Usage (hard-coded compare):
-  python validate_spongegis3_outputs.py ^
-    --spongegis_path SpongeGIS3.py ^
-    --csv ...\indicators_by_spu.csv ^
-    --missing-report ...\report_missing_inputs.txt ^
-    --use_hardcoded_r --hc_abs_tol 1e-6 --hc_rel_tol 1e-6
+To run:
+--spongegis_path
+E:\pythonProject\PythonProject\SpongeGIS\SpongeGIS3_updated_v3.py
+--csv
+Y:\download\Mamad\!SpongeGIStest\Kamienna\output\indicators_by_spu.csv
+--missing-report
+Y:\download\Mamad\!SpongeGIStest\Kamienna\output\report_missing_inputs.txt
+--use_hardcoded_r
+--hc_abs_tol
+1e-6
+--hc_rel_tol
+1e-6
+
 """
 
 from __future__ import annotations
