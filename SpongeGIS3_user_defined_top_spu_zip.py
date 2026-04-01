@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-r"""
+"""
 SpongeGIS (raster-based indicators by SPU)
 
 Key fixes / changes
@@ -25,31 +25,34 @@ Notes
   for ratio computations (i.e., it contributes 0 to the numerator and counts in the
   denominator via the SPU zone raster).
 
-To run
---spongegis_path
-C:\Users\p101727\Documents\GitHub\SpongeGIS\SpongeGIS3_updated_v3.py
---csv
-X:\download\Mamad\!SpongeGIStest\Kamienna\output\indicators_by_spu.csv
---missing-report
-X:\download\Mamad\!SpongeGIStest\Kamienna\output\report_missing_inputs.txt
---use_hardcoded_r
---hc_abs_tol
-1e-6
---hc_rel_tol
-1e-6
+How to use
+- Edit the USER-DEFINED SETTINGS section near the top of this file.
+- Set input_dir, output_dir, mandatory SPU/DEM names, optional layer names, and output names.
+- SPU can be a raster or a zipped shapefile; zipped shapefiles are rasterized automatically to the DEM grid using spu_id_field.
+- Run the script directly in PyCharm without command-line parameters.
 
 """
 
 from __future__ import annotations
 
-import argparse
 import time
+import tempfile
+import zipfile
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Sequence, Union
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
+
+# NumPy 2.x compatibility for older dependencies (e.g., pysheds still calling np.in1d)
+if not hasattr(np, "in1d"):
+    def _np_in1d_compat(ar1, ar2, assume_unique=False, invert=False, *, kind=None):
+        ar1 = np.asarray(ar1).ravel()
+        return np.isin(ar1, ar2, assume_unique=assume_unique, invert=invert, kind=kind)
+    np.in1d = _np_in1d_compat
+import geopandas as gpd
 import pandas as pd
 import rasterio
+from rasterio.features import rasterize
 from rasterio.warp import reproject, Resampling
 from scipy.ndimage import distance_transform_edt
 from pyproj import Transformer
@@ -72,6 +75,75 @@ ALL_FACTORS = [
     "GraniteRatio", "RainFallErodibility", "SoilErodibility",
 ]
 
+
+
+
+# ---------------------------
+# USER-DEFINED SETTINGS
+# Edit these values and run the script directly from PyCharm.
+# All relative paths are interpreted relative to INPUT_DIR.
+# ---------------------------
+
+USER_SETTINGS = {
+    # Main folders
+    "input_dir": r"X:\download\Mamad\!SpongeGIStest\Kamienna\input",
+    "output_dir": r"X:\download\Mamad\!SpongeGIStest\Kamienna\output",
+
+    # Required base inputs
+    # spu_name can be either:
+    #   - a raster file (e.g. "SPU100.tif")
+    #   - a zipped shapefile (e.g. r"C:\Users\p101727\Downloads\SPU250_3035.zip")
+    #   - a shapefile path (".shp")
+    "spu_name": r"C:\Users\p101727\Downloads\SPU250_3035.zip",
+    "dem_name": "DEM10.tif",
+    "spu_id_field": "ID",
+    "spu_all_touched": False,
+    "save_rasterized_spu": True,
+    "spu_rasterized_name": "SPU250_from_zip_on_dem_grid.tif",
+
+    # Output files
+    "output_csv_name": "indicators_by_spu.csv",
+    "missing_report_name": "report_missing_inputs.txt",
+
+    # Processing options
+    "stream_threshold_km2": 1.0,
+    "write_intermediates": False,
+    "flow_ratio_mode": "mhq_over_mlq",   # "mhq_over_mlq" or "mlq_over_mhq"
+    "cwb_sign": "flip",                  # "as_is" or "flip"
+    "assume_nodata_value": None,         # e.g. -9999
+    "treat_zero_as_nodata_for": [],      # e.g. ["cwb", "swr", "grr"]
+    "min_stream_cells_per_spu": 1,
+    "min_meander_mainlen_m": 0.0,
+
+    # User-defined layer filenames or relative paths.
+    # Set to None to let the script try alias-based auto-detection for that layer.
+    "input_files": {
+        "ForestRatio": "Forest.tif",
+        "LakeRatio": "Lake.tif",
+        "WetlandRatio": "Wetland.tif",
+        "OrchVegRatio": "Orchard.tif",
+        "UrbanRatio": "Urban.tif",
+        "ArableRatio": "Arable.tif",
+        "FloodRiskAreaRatio": "FloodExtent.tif",
+        "streams": None,
+        "GraniteRatio": "Granite.tif",
+        "ditches": "Ditches.tif",
+        "meadPastur": "MeadPastur.tif",
+        "nonForest": "NonForest.tif",
+        "cwb": "cwb.tif",
+        "swr": "swr.tif",
+        "grr": "grr.tif",
+        "pAvgAnn": "pAvgAnn.tif",
+        "pAvgVeg": "pAvgVeg.tif",
+        "swMMQ": "swMMQ.tif",
+        "swMLQ": "swMLQ.tif",
+        "swMHQ": "swMHQ.tif",
+        "sand": "SoilSand_Fraction.tif",
+        "silt": "SoilSilt_Fraction.tif",
+        "clay": "SoilClay_Fraction.tif",
+        "orgC": "SoilOrgC_Fraction.tif",
+    },
+}
 
 
 # ---------------------------
@@ -149,10 +221,44 @@ def _case_insensitive_lookup(folder: Path, name: str) -> Optional[Path]:
             return p
     return None
 
-def resolve_input(input_dir: Path, key: str) -> Optional[str]:
-    """Resolve an input raster path for a given logical key, using aliases and case-insensitive match."""
+def resolve_path(base_dir: Path, name_or_path: Optional[str]) -> Optional[str]:
+    """Resolve an explicit user-defined path. Relative paths are resolved against base_dir."""
+    if name_or_path is None:
+        return None
+    s = str(name_or_path).strip()
+    if not s:
+        return None
+
+    p = Path(s)
+    if not p.is_absolute():
+        p = base_dir / p
+
+    if p.exists():
+        return str(p)
+
+    # Case-insensitive check in parent folder when possible
+    if p.parent.exists():
+        q = _case_insensitive_lookup(p.parent, p.name)
+        if q is not None:
+            return str(q)
+
+    return None
+
+
+def resolve_input(input_dir: Path, key: str, user_inputs: Dict[str, Optional[str]]) -> Optional[str]:
+    """Resolve an input raster path for a given logical key.
+
+    Order:
+    1) exact user-defined path/name from USER_SETTINGS["input_files"]
+    2) alias-based auto-detection from INPUT_CANDIDATES
+    """
+    explicit = resolve_path(input_dir, user_inputs.get(key))
+    if explicit is not None:
+        return explicit
+
     if key not in INPUT_CANDIDATES:
         return None
+
     for fname in INPUT_CANDIDATES[key]:
         p = input_dir / fname
         if p.exists():
@@ -161,6 +267,101 @@ def resolve_input(input_dir: Path, key: str) -> Optional[str]:
         if q is not None:
             return str(q)
     return None
+
+
+
+
+# ---------------------------
+# SPU vector -> raster support
+# ---------------------------
+
+def find_shp_in_folder(folder: Path) -> Path:
+    shp_files = list(folder.rglob("*.shp"))
+    if not shp_files:
+        raise FileNotFoundError(f"No .shp file found inside: {folder}")
+    if len(shp_files) > 1:
+        log(f"Multiple shapefiles found in ZIP. Using first: {shp_files[0]}")
+    return shp_files[0]
+
+
+def _rasterize_spu_gdf_to_match(
+    gdf: "gpd.GeoDataFrame",
+    id_field: str,
+    match_prof: dict,
+    all_touched: bool = False,
+) -> Tuple[np.ndarray, dict]:
+    if gdf.empty:
+        raise ValueError("SPU vector layer is empty.")
+    if id_field not in gdf.columns:
+        raise ValueError(f"SPU ID field '{id_field}' not found. Available fields: {list(gdf.columns)}")
+    if gdf.crs is None:
+        raise ValueError("SPU vector layer has no CRS defined.")
+
+    gdf = gdf[gdf.geometry.notnull()].copy()
+    if gdf.empty:
+        raise ValueError("SPU vector layer has no valid geometries.")
+
+    gdf = gdf.to_crs(match_prof["crs"])
+    gdf = gdf[gdf.is_valid].copy()
+    if gdf.empty:
+        raise ValueError("All SPU geometries became invalid after reprojection/filtering.")
+
+    ids = pd.to_numeric(gdf[id_field], errors="coerce")
+    if ids.isnull().any():
+        raise ValueError(f"SPU ID field '{id_field}' contains non-numeric or null values.")
+
+    ids = ids.astype(np.int64)
+    if ids.duplicated().any():
+        dup_count = int(ids.duplicated().sum())
+        log(f"WARNING: SPU ID field '{id_field}' contains {dup_count} duplicated IDs.")
+
+    raster_dtype = "int32"
+    info = np.iinfo(np.int32)
+    if ids.min() < info.min or ids.max() > info.max:
+        raise ValueError("SPU IDs exceed int32 range; please simplify or remap IDs before rasterization.")
+
+    shapes = ((geom, int(val)) for geom, val in zip(gdf.geometry, ids))
+    zones = rasterize(
+        shapes=shapes,
+        out_shape=(int(match_prof["height"]), int(match_prof["width"])),
+        transform=match_prof["transform"],
+        fill=0,
+        dtype=raster_dtype,
+        all_touched=all_touched,
+    )
+
+    prof = match_prof.copy()
+    prof["dtype"] = raster_dtype
+    prof["nodata"] = 0
+    prof["count"] = 1
+    return zones.astype(np.int64), prof
+
+
+def load_spu_as_raster(
+    spu_source: str,
+    dem_prof: dict,
+    spu_id_field: str,
+    spu_all_touched: bool = False,
+) -> Tuple[np.ndarray, dict]:
+    src = Path(spu_source)
+    suffix = src.suffix.lower()
+
+    if suffix == ".zip":
+        with tempfile.TemporaryDirectory(prefix="spu_zip_") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            with zipfile.ZipFile(src, "r") as zf:
+                zf.extractall(tmpdir_path)
+            shp_path = find_shp_in_folder(tmpdir_path)
+            log(f"SPU ZIP extracted shapefile: {shp_path}")
+            gdf = gpd.read_file(shp_path)
+            return _rasterize_spu_gdf_to_match(gdf, spu_id_field, dem_prof, all_touched=spu_all_touched)
+
+    if suffix == ".shp":
+        gdf = gpd.read_file(src)
+        return _rasterize_spu_gdf_to_match(gdf, spu_id_field, dem_prof, all_touched=spu_all_touched)
+
+    zones_raw, prof = read_raster(str(src))
+    return sanitize_zones(zones_raw), prof
 
 
 # ---------------------------
@@ -667,112 +868,102 @@ def compute_soil_erodibility_uslek(sand: np.ndarray, silt: np.ndarray, clay: np.
 # ---------------------------
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input_dir", required=True, help="Folder containing all required rasters (SPU, DEM, inputs).")
-    ap.add_argument("--output_dir", required=True, help="Output folder.")
+    cfg = USER_SETTINGS
 
-    ap.add_argument("--spu_name", default="SPU100.tif", help="SPU raster used for zonal stats (default: SPU100.tif).")
-    ap.add_argument("--dem_name", default="DEM10.tif", help="DEM raster filename (default: DEM10.tif).")
-
-    ap.add_argument("--stream_threshold_km2", type=float, default=1.0)
-    ap.add_argument("--write_intermediates", action="store_true")
-
-    ap.add_argument(
-        "--flow_ratio_mode",
-        choices=["mhq_over_mlq", "mlq_over_mhq"],
-        default="mhq_over_mlq",
-        help="FlowMinMaxRatio definition (default: mhq_over_mlq).",
-    )
-    ap.add_argument(
-        "--cwb_sign",
-        choices=["as_is", "flip"],
-        default="flip",
-        help="CWB sign convention. Default flips sign to match the original indicators (PET-P style).",
-    )
-
-    ap.add_argument(
-        "--assume_nodata_value",
-        type=float,
-        default=None,
-        help="If an input raster has no nodata metadata, treat this value as nodata (converted to NaN for means).",
-    )
-    ap.add_argument(
-        "--treat_zero_as_nodata_for",
-        default="",
-        help="Comma-separated logical keys for which 0 will be treated as nodata for zonal MEAN (e.g., swr,cwb,grr).",
-    )
-
-    ap.add_argument(
-        "--min_stream_cells_per_spu",
-        type=int,
-        default=1,
-        help="SPUs with fewer stream cells than this will get NaN for DrainageD/RiverSlope/MeanderRatio.",
-    )
-    ap.add_argument(
-        "--min_meander_mainlen_m",
-        type=float,
-        default=0.0,
-        help="Skip meander computation if the main-stream length inside SPU is shorter than this (meters).",
-    )
-
-    args = ap.parse_args()
-
-    t_all = tic()
-    out_dir = Path(args.output_dir)
+    input_dir = Path(cfg["input_dir"])
+    out_dir = Path(cfg["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    input_dir = Path(args.input_dir)
+    spu_path = resolve_path(input_dir, cfg["spu_name"])
+    dem_path = resolve_path(input_dir, cfg["dem_name"])
 
-    spu_path = input_dir / args.spu_name
-    dem_path = input_dir / args.dem_name
+    if spu_path is None:
+        raise FileNotFoundError(f'SPU source not found: {cfg["spu_name"]}')
+    if dem_path is None:
+        raise FileNotFoundError(f'DEM raster not found: {cfg["dem_name"]}')
 
-    if not spu_path.exists():
-        raise FileNotFoundError(str(spu_path))
-    if not dem_path.exists():
-        raise FileNotFoundError(str(dem_path))
+    stream_threshold_km2 = float(cfg.get("stream_threshold_km2", 1.0))
+    write_intermediates = bool(cfg.get("write_intermediates", False))
+    flow_ratio_mode = str(cfg.get("flow_ratio_mode", "mhq_over_mlq"))
+    cwb_sign = str(cfg.get("cwb_sign", "flip"))
+    assume_nodata_value = cfg.get("assume_nodata_value", None)
+    treat_zero_keys = {str(k).strip() for k in cfg.get("treat_zero_as_nodata_for", []) if str(k).strip()}
+    min_stream_cells_per_spu = int(cfg.get("min_stream_cells_per_spu", 1))
+    min_meander_mainlen_m = float(cfg.get("min_meander_mainlen_m", 0.0))
+    user_inputs = cfg.get("input_files", {})
+    spu_id_field = str(cfg.get("spu_id_field", "ID"))
+    spu_all_touched = bool(cfg.get("spu_all_touched", False))
+    save_rasterized_spu = bool(cfg.get("save_rasterized_spu", False))
+    spu_rasterized_name = str(cfg.get("spu_rasterized_name", "SPU_rasterized_from_vector.tif"))
+
+    if flow_ratio_mode not in {"mhq_over_mlq", "mlq_over_mhq"}:
+        raise ValueError('flow_ratio_mode must be "mhq_over_mlq" or "mlq_over_mhq"')
+    if cwb_sign not in {"as_is", "flip"}:
+        raise ValueError('cwb_sign must be "as_is" or "flip"')
+
+    t_all = tic()
 
     log(f"INPUT_DIR: {input_dir}")
-    log(f"SPU: {spu_path}")
+    log(f"OUTPUT_DIR: {out_dir}")
+    log(f"SPU source: {spu_path}")
     log(f"DEM: {dem_path}")
 
-    treat_zero_keys = {k.strip() for k in args.treat_zero_as_nodata_for.split(",") if k.strip()}
-
-    # SPU grid used as landuse/zonal grid for landcover/climate/soil indicators
-    zonesL_raw, profL = read_raster(str(spu_path))
-    zonesL = sanitize_zones(zonesL_raw)
-
     # DEM grid for terrain + streams indicators
-    dem_raw, dem_prof = read_raster(str(dem_path))
+    dem_raw, dem_prof = read_raster(dem_path)
     dem = dem_raw.astype(np.float32, copy=False)
     if dem_prof.get("nodata") is not None:
         dem = np.where(dem == float(dem_prof["nodata"]), np.nan, dem)
 
-    # Reproject SPU to DEM grid (nearest, nodata=0) if needed
-    with rasterio.open(str(spu_path)) as ds:
-        need_reproj = (ds.crs != dem_prof["crs"]) or (ds.transform != dem_prof["transform"]) or (ds.width != dem_prof["width"]) or (ds.height != dem_prof["height"])
-    if need_reproj:
-        log("Reprojecting SPU to DEM grid (nearest, nodata=0)...")
-        zones_dem = reproject_zones_to_match(str(spu_path), dem_prof, zone_nodata_out=0)
-    else:
+    # SPU can be either a raster or a vector ZIP/SHP.
+    spu_suffix = Path(spu_path).suffix.lower()
+    if spu_suffix in {".zip", ".shp"}:
+        log(f"SPU source is vector ({spu_suffix}); rasterizing to DEM grid using field '{spu_id_field}'...")
+        zonesL, profL = load_spu_as_raster(
+            spu_source=spu_path,
+            dem_prof=dem_prof,
+            spu_id_field=spu_id_field,
+            spu_all_touched=spu_all_touched,
+        )
         zones_dem = zonesL.copy()
+
+        if save_rasterized_spu:
+            spu_out = out_dir / spu_rasterized_name
+            write_raster(str(spu_out), zonesL.astype(np.int32), profL, nodata=0, dtype="int32")
+            log(f"Saved rasterized SPU: {spu_out}")
+    else:
+        # SPU grid used as landuse/zonal grid for landcover/climate/soil indicators
+        zonesL_raw, profL = read_raster(spu_path)
+        zonesL = sanitize_zones(zonesL_raw)
+
+        # Reproject SPU to DEM grid (nearest, nodata=0) if needed
+        with rasterio.open(spu_path) as ds:
+            need_reproj = (ds.crs != dem_prof["crs"]) or (ds.transform != dem_prof["transform"]) or (ds.width != dem_prof["width"]) or (ds.height != dem_prof["height"])
+        if need_reproj:
+            log("Reprojecting SPU to DEM grid (nearest, nodata=0)...")
+            zones_dem = reproject_zones_to_match(spu_path, dem_prof, zone_nodata_out=0)
+        else:
+            zones_dem = zonesL.copy()
+
+    zonesL = sanitize_zones(zonesL)
+    zones_dem = sanitize_zones(zones_dem)
 
     # DEM hydrology (flowdir/acc) derived from DEM - in memory
     t0 = tic()
     fdir, acc, streams01_dem = derive_hydro_from_dem(
-        dem_path=str(dem_path),
-        stream_threshold_km2=args.stream_threshold_km2,
+        dem_path=dem_path,
+        stream_threshold_km2=stream_threshold_km2,
     )
     toc(t0, "DEM hydrology derived (in-memory)")
 
     # Prefer an explicit stream mask if present (to better match the legacy river network),
     # otherwise fall back to DEM-derived thresholded streams.
-    streams_tif = resolve_input(input_dir, "streams")
+    streams_tif = resolve_input(input_dir, "streams", user_inputs)
     if streams_tif:
         log(f"Streams source: {streams_tif} (using provided stream mask)")
         streams01 = reproject_to_match(
             streams_tif, dem_prof, Resampling.nearest,
             dst_dtype=np.float32, dst_nodata=np.nan,
-            nodata_assumed=args.assume_nodata_value,
+            nodata_assumed=assume_nodata_value,
             treat_zero_as_nodata=False,
         )
         streams01 = ((streams01 > 0) & np.isfinite(streams01)).astype(np.uint8)
@@ -786,7 +977,7 @@ def main():
     xres, yres = cellsize_from_profile(dem_prof)
     twi_arr = safe_twi(acc, slope_rad, cell_area=xres * yres)
 
-    if args.write_intermediates:
+    if write_intermediates:
         hydro_dir = out_dir / "hydro"
         hydro_dir.mkdir(parents=True, exist_ok=True)
         write_raster(str(hydro_dir / "streams.tif"), streams01.astype(np.uint8), dem_prof, nodata=0, dtype="uint8")
@@ -802,7 +993,7 @@ def main():
     # ---- Area-% indicators (binary masks), computed on SPU grid ----
     area_fac = ["ForestRatio", "LakeRatio", "WetlandRatio", "OrchVegRatio", "UrbanRatio", "ArableRatio", "FloodRiskAreaRatio", "GraniteRatio"]
     for fac in area_fac:
-        tif = resolve_input(input_dir, fac)
+        tif = resolve_input(input_dir, fac, user_inputs)
         log(f"{fac} source: {tif if tif else 'MISSING'}")
         if tif is None:
             missing.append(f"{fac}: missing one of {INPUT_CANDIDATES.get(fac, [])}")
@@ -817,8 +1008,8 @@ def main():
         results[fac] = zonal_percent_area(zonesL, hit.astype(np.uint8))
 
     # ---- ReclaimedRatio (ditches buffer 100m intersect meadPastur) on SPU grid ----
-    ditches = resolve_input(input_dir, "ditches")
-    mead = resolve_input(input_dir, "meadPastur")
+    ditches = resolve_input(input_dir, "ditches", user_inputs)
+    mead = resolve_input(input_dir, "meadPastur", user_inputs)
     log(f"ReclaimedRatio sources: ditches={ditches if ditches else 'MISSING'}, meadPastur={mead if mead else 'MISSING'}")
     if ditches and mead:
         d_arr = reproject_to_match(ditches, profL, Resampling.nearest, dst_dtype=np.float32, dst_nodata=np.nan)
@@ -837,7 +1028,7 @@ def main():
         missing.append("ReclaimedRatio: missing ditches and/or meadPastur raster")
 
     # ---- NonForestedRatio (nonForest AND slope_rad>0.05) on DEM grid ----
-    nonf = resolve_input(input_dir, "nonForest")
+    nonf = resolve_input(input_dir, "nonForest", user_inputs)
     log(f"NonForestedRatio source: {nonf if nonf else 'MISSING'}")
     if nonf:
         nonf_dem = reproject_to_match(nonf, dem_prof, Resampling.nearest, dst_dtype=np.float32, dst_nodata=np.nan)
@@ -858,8 +1049,8 @@ def main():
         acc=acc,
         streams01=streams01,
         prof=dem_prof,
-        min_stream_cells_per_spu=args.min_stream_cells_per_spu,
-        min_meander_mainlen_m=args.min_meander_mainlen_m,
+        min_stream_cells_per_spu=min_stream_cells_per_spu,
+        min_meander_mainlen_m=min_meander_mainlen_m,
     )
     results["DrainageD"] = stream_stats["DrainageD"]
     results["RiverSlope"] = stream_stats["RiverSlope"]
@@ -867,7 +1058,7 @@ def main():
 
     # ---- Optional rasters (zonal mean on SPU grid) ----
     def mean_from_optional(key: str, resampling: Resampling = Resampling.bilinear) -> Optional[pd.Series]:
-        tif = resolve_input(input_dir, key)
+        tif = resolve_input(input_dir, key, user_inputs)
         log(f"{key} source: {tif if tif else 'MISSING'}")
         if not tif:
             missing.append(f"{key}: missing one of {INPUT_CANDIDATES.get(key, [])}")
@@ -875,7 +1066,7 @@ def main():
         arr = reproject_to_match(
             tif, profL, resampling,
             dst_dtype=np.float32, dst_nodata=np.nan,
-            nodata_assumed=args.assume_nodata_value,
+            nodata_assumed=assume_nodata_value,
             treat_zero_as_nodata=(key in treat_zero_keys),
         )
         return zonal_mean(zonesL, arr)
@@ -884,25 +1075,25 @@ def main():
     for fac in ["cwb", "swr", "grr"]:
         s = mean_from_optional(fac, resampling=Resampling.bilinear)
         if s is not None:
-            if fac == "cwb" and args.cwb_sign == "flip":
+            if fac == "cwb" and cwb_sign == "flip":
                 s = -1.0 * s
             results[fac] = s
 
     # sri = mean(swMMQ / pAvgAnn)  (matches original raster-ratio definition)
-    pavgann = resolve_input(input_dir, "pAvgAnn")
-    swmmq = resolve_input(input_dir, "swMMQ")
+    pavgann = resolve_input(input_dir, "pAvgAnn", user_inputs)
+    swmmq = resolve_input(input_dir, "swMMQ", user_inputs)
     log(f"sri sources: pAvgAnn={pavgann if pavgann else 'MISSING'}, swMMQ={swmmq if swmmq else 'MISSING'}")
     if pavgann and swmmq:
         P = reproject_to_match(
             pavgann, profL, Resampling.bilinear,
             dst_dtype=np.float32, dst_nodata=np.nan,
-            nodata_assumed=args.assume_nodata_value,
+            nodata_assumed=assume_nodata_value,
             treat_zero_as_nodata=("pAvgAnn" in treat_zero_keys),
         )
         Q = reproject_to_match(
             swmmq, profL, Resampling.bilinear,
             dst_dtype=np.float32, dst_nodata=np.nan,
-            nodata_assumed=args.assume_nodata_value,
+            nodata_assumed=assume_nodata_value,
             treat_zero_as_nodata=("swMMQ" in treat_zero_keys),
         )
         ratio_arr = np.full(P.shape, np.nan, dtype=np.float32)
@@ -913,27 +1104,27 @@ def main():
         missing.append("sri: missing pAvgAnn and/or swMMQ raster")
 
     # FlowMinMaxRatio
-    swmlq = resolve_input(input_dir, "swMLQ")
-    swmhq = resolve_input(input_dir, "swMHQ")
+    swmlq = resolve_input(input_dir, "swMLQ", user_inputs)
+    swmhq = resolve_input(input_dir, "swMHQ", user_inputs)
     log(f"FlowMinMaxRatio sources: swMLQ={swmlq if swmlq else 'MISSING'}, swMHQ={swmhq if swmhq else 'MISSING'}")
     if swmlq and swmhq:
         MLQ = reproject_to_match(
             swmlq, profL, Resampling.bilinear,
             dst_dtype=np.float32, dst_nodata=np.nan,
-            nodata_assumed=args.assume_nodata_value,
+            nodata_assumed=assume_nodata_value,
             treat_zero_as_nodata=("swMLQ" in treat_zero_keys),
         )
         MHQ = reproject_to_match(
             swmhq, profL, Resampling.bilinear,
             dst_dtype=np.float32, dst_nodata=np.nan,
-            nodata_assumed=args.assume_nodata_value,
+            nodata_assumed=assume_nodata_value,
             treat_zero_as_nodata=("swMHQ" in treat_zero_keys),
         )
 
         ratio_arr = np.full(MLQ.shape, np.nan, dtype=np.float32)
         ok = np.isfinite(MLQ) & np.isfinite(MHQ)
 
-        if args.flow_ratio_mode == "mhq_over_mlq":
+        if flow_ratio_mode == "mhq_over_mlq":
             ok = ok & (MLQ != 0.0)
             ratio_arr[ok] = (MHQ[ok] / MLQ[ok]).astype(np.float32)
         else:
@@ -947,19 +1138,19 @@ def main():
     # RainFallErodibility needs pAvgAnn and pAvgVeg
     # Original definition uses a latitude-based fuzzy weighting between two erodibility formulations,
     # aggregated by SPU using MEDIAN (not mean).
-    pavgveg = resolve_input(input_dir, "pAvgVeg")
+    pavgveg = resolve_input(input_dir, "pAvgVeg", user_inputs)
     log(f"RainFallErodibility sources: pAvgAnn={pavgann if pavgann else 'MISSING'}, pAvgVeg={pavgveg if pavgveg else 'MISSING'}")
     if pavgann and pavgveg:
         Pann = reproject_to_match(
             pavgann, profL, Resampling.bilinear,
             dst_dtype=np.float32, dst_nodata=np.nan,
-            nodata_assumed=args.assume_nodata_value,
+            nodata_assumed=assume_nodata_value,
             treat_zero_as_nodata=("pAvgAnn" in treat_zero_keys),
         )
         Pveg = reproject_to_match(
             pavgveg, profL, Resampling.bilinear,
             dst_dtype=np.float32, dst_nodata=np.nan,
-            nodata_assumed=args.assume_nodata_value,
+            nodata_assumed=assume_nodata_value,
             treat_zero_as_nodata=("pAvgVeg" in treat_zero_keys),
         )
 
@@ -981,16 +1172,16 @@ def main():
         missing.append("RainFallErodibility: missing pAvgAnn and/or pAvgVeg raster")
 
     # SoilErodibility needs sand/silt/clay/orgC (fractions)
-    sand = resolve_input(input_dir, "sand")
-    silt = resolve_input(input_dir, "silt")
-    clay = resolve_input(input_dir, "clay")
-    orgc = resolve_input(input_dir, "orgC")
+    sand = resolve_input(input_dir, "sand", user_inputs)
+    silt = resolve_input(input_dir, "silt", user_inputs)
+    clay = resolve_input(input_dir, "clay", user_inputs)
+    orgc = resolve_input(input_dir, "orgC", user_inputs)
     log(f"SoilErodibility sources: sand={sand if sand else 'MISSING'}, silt={silt if silt else 'MISSING'}, clay={clay if clay else 'MISSING'}, orgC={orgc if orgc else 'MISSING'}")
     if sand and silt and clay and orgc:
-        Sand = reproject_to_match(sand, profL, Resampling.bilinear, dst_dtype=np.float32, dst_nodata=np.nan, nodata_assumed=args.assume_nodata_value)
-        Silt = reproject_to_match(silt, profL, Resampling.bilinear, dst_dtype=np.float32, dst_nodata=np.nan, nodata_assumed=args.assume_nodata_value)
-        Clay = reproject_to_match(clay, profL, Resampling.bilinear, dst_dtype=np.float32, dst_nodata=np.nan, nodata_assumed=args.assume_nodata_value)
-        OrgC = reproject_to_match(orgc, profL, Resampling.bilinear, dst_dtype=np.float32, dst_nodata=np.nan, nodata_assumed=args.assume_nodata_value)
+        Sand = reproject_to_match(sand, profL, Resampling.bilinear, dst_dtype=np.float32, dst_nodata=np.nan, nodata_assumed=assume_nodata_value)
+        Silt = reproject_to_match(silt, profL, Resampling.bilinear, dst_dtype=np.float32, dst_nodata=np.nan, nodata_assumed=assume_nodata_value)
+        Clay = reproject_to_match(clay, profL, Resampling.bilinear, dst_dtype=np.float32, dst_nodata=np.nan, nodata_assumed=assume_nodata_value)
+        OrgC = reproject_to_match(orgc, profL, Resampling.bilinear, dst_dtype=np.float32, dst_nodata=np.nan, nodata_assumed=assume_nodata_value)
         uslek = compute_soil_erodibility_uslek(Sand, Silt, Clay, OrgC)
         results["SoilErodibility"] = zonal_median(zonesL, uslek)
     else:
@@ -1000,10 +1191,10 @@ def main():
     ordered = {f: results.get(f, pd.Series(dtype=float)) for f in ALL_FACTORS}
     out_df = merge_series(ordered)
 
-    out_csv = out_dir / "indicators_by_spu.csv"
+    out_csv = out_dir / str(cfg.get("output_csv_name", "indicators_by_spu.csv"))
     out_df.to_csv(out_csv, index=False)
 
-    report = out_dir / "report_missing_inputs.txt"
+    report = out_dir / str(cfg.get("missing_report_name", "report_missing_inputs.txt"))
     report.write_text("\n".join(missing) if missing else "All required inputs were found.\n", encoding="utf-8")
 
     log(f"Saved: {out_csv}")
