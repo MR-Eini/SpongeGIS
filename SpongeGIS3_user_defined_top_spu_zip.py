@@ -96,7 +96,7 @@ USER_SETTINGS = {
     #   - a shapefile path (".shp")
     "spu_name": r"C:\Users\p101727\Downloads\SPU250_3035.zip",
     "dem_name": "DEM10.tif",
-    "spu_id_field": "ID",
+    "spu_id_field": "Id",
     "spu_all_touched": False,
     "save_rasterized_spu": True,
     "spu_rasterized_name": "SPU250_from_zip_on_dem_grid.tif",
